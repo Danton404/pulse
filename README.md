@@ -29,7 +29,7 @@ Each device (iPhone home-screen app, laptop browser) keeps its own settings, key
 
 ## Deploy
 
-Double-click `deploy.command`: commits and pushes to GitHub; Pages republishes in about a minute. Bump `VERSION` in `sw.js` when you change files.
+Double-click `deploy.command`. It refreshes the offline file list and cache version in `sw.js`, asks for a short description, commits and pushes to GitHub, waits until GitHub Pages serves the new version, then opens the site. On iPhone, close and reopen Pulse to load it.
 
 ## Run locally
 

@@ -31,10 +31,10 @@ const ICONS = {
 };
 const icon = (n, s = 22) => `<svg class="i" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[n]}</svg>`;
 
-// Today first; Live only where Web Bluetooth exists (not on iPhone).
+// Same tabs on every device; where Bluetooth isn't available (iPhone browsers), Live explains the options.
 const TABS = [
   { id: 'health', label: 'Today', icon: 'activity' },
-  ...(ble.supported ? [{ id: 'live', label: 'Live', icon: 'heart' }] : []),
+  { id: 'live', label: 'Live', icon: 'heart' },
   { id: 'workouts', label: 'Workouts', icon: 'timer' },
   { id: 'coach', label: 'Coach', icon: 'sparkles' },
 ];
@@ -289,11 +289,12 @@ function renderLive() {
       <span class="num">${i ? `${zoneBpm(i, p)}+` : `&lt;${zoneBpm(1, p)}`}</span></div>`).join('');
 
   const connectCard = !ble.supported
-    ? `<section class="card empty"><h2>Bluetooth isn't available in this browser</h2>
-        <p class="muted">Live heart rate uses Web Bluetooth. Safari and every other iPhone browser except one don't support it.</p>
-        <ol><li>On iPhone: install the free <a href="https://apps.apple.com/app/bluefy-web-ble-browser/id1492822055" target="_blank" rel="noopener">Bluefy</a> browser and open Pulse in it.</li>
-        <li>On a Mac or Android: use Chrome.</li>
-        <li>In the Google Health app: Fitbit Air settings, Connections, turn on Share heart rate.</li></ol></section>`
+    ? `<section class="card empty"><h2>Live heart rate needs Bluetooth</h2>
+        <p class="muted">${isIos ? 'Apple doesn\'t let Safari or home-screen apps use Bluetooth, so this device can\'t connect to the Air directly.' : 'This browser can\'t use Bluetooth.'} Your heart rate still updates every minute on Today.</p>
+        <ol>${isIos ? '<li>For second-by-second heart rate on iPhone, open danton404.github.io/pulse in the free <a href="https://apps.apple.com/app/bluefy-web-ble-browser/id1492822055" target="_blank" rel="noopener">Bluefy</a> browser.</li>' : ''}
+        <li>On a laptop: use Chrome, Edge or Brave.</li>
+        <li>In the Google Health app: Fitbit Air settings, Connections, turn on Share heart rate.</li></ol>
+        <a class="btn primary" href="#health">Go to Today</a></section>`
     : '';
 
   $('#view').innerHTML = `${connectCard}
