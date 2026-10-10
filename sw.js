@@ -1,8 +1,8 @@
 // Network-first for the app shell so updates show up immediately; cache is the offline fallback.
 // API requests (other origins) are never cached.
-const VERSION = 'pulse-v2';
+const VERSION = 'pulse-v3';
 const SHELL = ['./', 'index.html', 'css/app.css', 'manifest.webmanifest', 'icon.svg', 'icon-180.png', 'icon-192.png', 'icon-512.png',
-  'js/app.js', 'js/store.js', 'js/calc.js', 'js/ble.js', 'js/health.js', 'js/ai.js'];
+  'js/app.js', 'js/store.js', 'js/calc.js', 'js/ble.js', 'js/health.js', 'js/ai.js', 'js/insights.js'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(VERSION).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));

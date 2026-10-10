@@ -1,7 +1,8 @@
 import { settings, saveSettings, workouts, healthCache } from './store.js';
 import { ble, connect, reconnect, disconnect } from './ble.js';
-import { ZONES, maxHr, zoneIndex, zoneBpm, summarize, rmssd, fmtDuration, zScore } from './calc.js';
-import { signIn, signOut, signedIn, fetchHealth, fetchHrRange, handleRedirect, AuthError, isoDay } from './health.js';
+import { ZONES, maxHr, zoneIndex, zoneBpm, summarize, rmssd, fmtDuration } from './calc.js';
+import { signIn, signOut, signedIn, fetchHealth, fetchHrRange, refreshToday, handleRedirect, AuthError, isoDay } from './health.js';
+import { METRICS, series, stats, sortedDays, readiness, sleepScore, bedtimeSpread, trainingLoad, trimp, cardioMinutes, shredPlan, vo2, vo2Band } from './insights.js';
 import { askClaude, MODELS } from './ai.js';
 
 // ---------- Helpers
@@ -64,39 +65,113 @@ function openSheet(title, body, bind) {
 sheet.addEventListener('click', (e) => { if (e.target === sheet) sheet.close(); });
 
 // ---------- Charts (canvas, no library)
-function drawLine(canvas, pts, { min, max, labels = false, fill = true } = {}) {
+// pts: [[x, y], ...] or [[x, y, lo, hi], ...] with band: true. Scale info is kept on the canvas for scrub().
+function drawLine(canvas, pts, opts = {}) {
+  const { min, max, labels = false, fill = true, band = false, dots = false, target = null, fmtY = null } = opts;
   const dpr = devicePixelRatio || 1, w = canvas.clientWidth, h = canvas.clientHeight;
   if (!w || !h) return;
   canvas.width = w * dpr; canvas.height = h * dpr;
   const c = canvas.getContext('2d');
   c.scale(dpr, dpr);
   c.clearRect(0, 0, w, h);
-  if (pts.length < 2) return;
+  canvas._chart = null;
+  if (pts.length < 2) {
+    if (labels) { c.font = '13px Inter, system-ui, sans-serif'; c.fillStyle = css('--muted'); c.fillText('Not enough data yet', 8, h / 2); }
+    return;
+  }
   let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
-  for (const [x, y] of pts) { x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); }
-  y0 = min ?? y0 - 5; y1 = max ?? y1 + 5;
-  const left = labels ? 32 : 0, pad = 6;
-  const X = (x) => left + ((x - x0) / (x1 - x0 || 1)) * (w - left);
+  for (const p of pts) {
+    x0 = Math.min(x0, p[0]); x1 = Math.max(x1, p[0]);
+    y0 = Math.min(y0, band && p[2] != null ? p[2] : p[1]); y1 = Math.max(y1, band && p[3] != null ? p[3] : p[1]);
+  }
+  if (target != null) { y0 = Math.min(y0, target); y1 = Math.max(y1, target); }
+  const padY = (y1 - y0) * 0.08 || 5;
+  y0 = min ?? y0 - padY; y1 = max ?? y1 + padY;
+  const left = labels ? 36 : 0, pad = 6;
+  const X = (x) => left + ((x - x0) / (x1 - x0 || 1)) * (w - left - 4);
   const Y = (y) => h - pad - ((y - y0) / (y1 - y0 || 1)) * (h - 2 * pad);
   if (labels) {
     c.font = '11px Inter, system-ui, sans-serif';
     c.fillStyle = css('--muted'); c.strokeStyle = css('--grid'); c.lineWidth = 1;
-    for (const v of [y0, (y0 + y1) / 2, y1]) {
+    for (const v of [y0 + padY, (y0 + y1) / 2, y1 - padY]) {
       const y = Math.round(Y(v)) + 0.5;
       c.beginPath(); c.moveTo(left, y); c.lineTo(w, y); c.stroke();
-      c.fillText(Math.round(v), 0, Math.min(h - 2, Math.max(10, y + 4)));
+      c.fillText(fmtY ? fmtY(v) : Math.round(v), 0, Math.min(h - 2, Math.max(10, y + 4)));
     }
   }
   const color = css('--accent');
+  if (band) {
+    c.beginPath();
+    pts.forEach((p, i) => (i ? c.lineTo(X(p[0]), Y(p[3] ?? p[1])) : c.moveTo(X(p[0]), Y(p[3] ?? p[1]))));
+    [...pts].reverse().forEach((p) => c.lineTo(X(p[0]), Y(p[2] ?? p[1])));
+    c.closePath(); c.fillStyle = alpha(color, 0.15); c.fill();
+  }
+  if (target != null) {
+    const ty = Math.round(Y(target)) + 0.5;
+    c.strokeStyle = css('--success'); c.lineWidth = 1; c.setLineDash([4, 4]);
+    c.beginPath(); c.moveTo(left, ty); c.lineTo(w, ty); c.stroke(); c.setLineDash([]);
+    c.fillStyle = css('--success'); c.font = '11px Inter, system-ui, sans-serif';
+    c.fillText('Target', w - 44, ty - 4);
+  }
   c.beginPath();
   pts.forEach(([x, y], i) => (i ? c.lineTo(X(x), Y(y)) : c.moveTo(X(x), Y(y))));
   c.strokeStyle = color; c.lineWidth = 2; c.lineJoin = 'round'; c.stroke();
-  if (fill) {
+  if (fill && !band) {
     c.lineTo(X(x1), h); c.lineTo(X(x0), h); c.closePath();
     const g = c.createLinearGradient(0, 0, 0, h);
     g.addColorStop(0, alpha(color, 0.22)); g.addColorStop(1, alpha(color, 0));
     c.fillStyle = g; c.fill();
   }
+  if (dots && pts.length <= 45) {
+    c.fillStyle = color;
+    for (const [x, y] of pts) { c.beginPath(); c.arc(X(x), Y(y), 2.5, 0, Math.PI * 2); c.fill(); }
+  }
+  canvas._chart = { pts, X, Y, opts };
+}
+
+// Drag a finger (or move the mouse) across a chart to see the exact time and value.
+let scrubbing = false;
+function scrub(canvas, label) {
+  canvas._label = label;
+  if (canvas._scrubbed) return;
+  canvas._scrubbed = true;
+  canvas.style.touchAction = 'pan-y'; // vertical swipes still scroll the page
+  const box = canvas.parentElement;
+  if (getComputedStyle(box).position === 'static') box.style.position = 'relative';
+  const tip = document.createElement('div');
+  tip.className = 'tip'; tip.hidden = true; tip.setAttribute('role', 'status');
+  box.append(tip);
+  let timer;
+  const show = (e) => {
+    const ch = canvas._chart;
+    if (!ch) return;
+    clearTimeout(timer);
+    const x = e.clientX - canvas.getBoundingClientRect().left;
+    let best = ch.pts[0], bd = Infinity;
+    for (const p of ch.pts) { const d = Math.abs(ch.X(p[0]) - x); if (d < bd) { bd = d; best = p; } }
+    drawLine(canvas, ch.pts, ch.opts);
+    const c = canvas.getContext('2d'), px = ch.X(best[0]), py = ch.Y(best[1]);
+    c.strokeStyle = css('--muted'); c.lineWidth = 1; c.setLineDash([3, 3]);
+    c.beginPath(); c.moveTo(px, 0); c.lineTo(px, canvas.clientHeight); c.stroke(); c.setLineDash([]);
+    c.beginPath(); c.arc(px, py, 5, 0, Math.PI * 2); c.fillStyle = css('--accent'); c.fill();
+    c.lineWidth = 2; c.strokeStyle = css('--surface'); c.stroke();
+    tip.innerHTML = canvas._label(best);
+    tip.hidden = false;
+    const half = tip.offsetWidth / 2, cx = canvas.offsetLeft + px;
+    tip.style.left = `${Math.max(half, Math.min(box.clientWidth - half, cx))}px`;
+    tip.style.top = `${canvas.offsetTop}px`;
+    scrubbing = true;
+  };
+  const hide = () => {
+    tip.hidden = true; scrubbing = false;
+    const ch = canvas._chart;
+    if (ch) drawLine(canvas, ch.pts, ch.opts);
+  };
+  canvas.addEventListener('pointerdown', show);
+  canvas.addEventListener('pointermove', (e) => { if (e.pointerType === 'mouse' || e.buttons) show(e); });
+  canvas.addEventListener('pointerup', (e) => { if (e.pointerType !== 'mouse') timer = setTimeout(hide, 2000); });
+  canvas.addEventListener('pointerleave', (e) => { if (e.pointerType === 'mouse') hide(); });
+  canvas.addEventListener('pointercancel', hide);
 }
 
 function downsample(pts, n = 600) {
@@ -352,12 +427,12 @@ async function renderWorkouts() {
   }));
 }
 
-function barsHtml(obj) {
+function barsHtml(obj, fmt = fmtDuration) {
   const entries = Object.entries(obj), total = entries.reduce((a, [, v]) => a + v, 0) || 1;
   return `<div class="zones">${entries.map(([name, v], i) => `
     <div class="zone-row"><span>${name}</span>
       <div class="zone-track"><div class="zone-fill" style="width:${(v / total) * 100}%;background:var(--z${i + 2})"></div></div>
-      <span class="num">${fmtDuration(v)}</span></div>`).join('')}</div>`;
+      <span class="num">${fmt(v)}</span></div>`).join('')}</div>`;
 }
 
 function openFitbitWorkout(w) {
@@ -381,10 +456,14 @@ function openFitbitWorkout(w) {
     try {
       const pts = await fetchHrRange(new Date(w.start), new Date(w.end), 30);
       if (!pts.length) { box.innerHTML = '<p class="hint">No heart-rate samples for this workout.</p>'; return; }
-      box.innerHTML = '<canvas class="chart tall" role="img" aria-label="Heart rate during the workout"></canvas>';
+      box.innerHTML = '<div class="chart-box"><canvas class="chart tall" role="img" aria-label="Heart rate during the workout. Drag to inspect."></canvas></div>';
       const max = Math.max(...pts.map((p) => p[3] ?? p[1]));
       box.insertAdjacentHTML('beforeend', `<p class="small muted">Max ${max} bpm</p>`);
-      requestAnimationFrame(() => drawLine(box.querySelector('canvas'), pts.map(([t, v]) => [t, v]), { labels: true }));
+      requestAnimationFrame(() => {
+        const c = box.querySelector('canvas');
+        drawLine(c, pts, { labels: true, band: true });
+        scrub(c, (x) => `<strong>${x[1]} bpm</strong> ${fmtTime(x[0])} · ${fmtDuration((x[0] - w.start) / 1000)} in`);
+      });
     } catch (e) { box.innerHTML = `<p class="hint">${esc(e.message)}</p>`; }
   });
 }
@@ -392,7 +471,7 @@ function openFitbitWorkout(w) {
 function openWorkout(w) {
   const s = w.summary;
   openSheet(`${w.title}, ${fmtDate(w.start)}`, `
-    <canvas class="chart tall" id="w-chart" role="img" aria-label="Heart rate during the workout"></canvas>
+    <div class="chart-box"><canvas class="chart tall" id="w-chart" role="img" aria-label="Heart rate during the workout. Drag to inspect."></canvas></div>
     <div class="mini-stats">
       <div><strong>${fmtDuration(s.duration)}</strong><span>Duration</span></div>
       <div><strong>${s.avg}</strong><span>Avg bpm</span></div>
@@ -402,7 +481,11 @@ function openWorkout(w) {
     ${w.rmssd ? `<p class="small muted">HRV during workout (RMSSD): ${w.rmssd} ms</p>` : ''}
     <div><h3 style="margin-bottom:8px">Time in zones</h3>${zonesHtml(s.zones)}</div>
     <button class="btn danger" type="button" id="del">${icon('trash', 18)} Delete workout</button>`, (el) => {
-    requestAnimationFrame(() => drawLine(el.querySelector('#w-chart'), downsample(w.samples), { labels: true }));
+    requestAnimationFrame(() => {
+      const c = el.querySelector('#w-chart');
+      drawLine(c, downsample(w.samples), { labels: true });
+      scrub(c, (x) => `<strong>${x[1]} bpm</strong> ${fmtDuration(x[0])} in`);
+    });
     el.querySelector('#del').onclick = async () => {
       const { source, duration, avgHr, kcal, ...orig } = w;
       await workouts.del(w.id);
@@ -413,58 +496,41 @@ function openWorkout(w) {
   });
 }
 
-// ---------- Health view
+// ---------- Health view (Today)
 let healthLoading = false;
+const P = () => settings.profile;
+const dayLabel = (d) => fmtDate(`${d}T12:00`);
+const metricFmt = (key, v) => (v == null ? '--' : key === 'sleepMin' ? fmtSleep(v) : nf(v, METRICS[key].dec));
+const targetFor = (key) => ({ sleepMin: P().sleepTarget * 60, steps: P().stepTarget })[key];
+const signed = (v, fmt) => `${v > 0 ? '+' : v < 0 ? '−' : '±'}${fmt(Math.abs(v))}`;
+const allWorkouts = async () => workoutRows((await workouts.all()).filter((w) => !w.active));
 
-function series(days, key, n = 30) {
-  return Object.keys(days).sort().slice(-n).map((d) => [d, days[d][key]]).filter(([, v]) => v != null);
+function statCard(key, days) {
+  const m = METRICS[key], st = stats(series(days, key, 30));
+  if (!st) return `<button class="card stat tap" type="button" data-metric="${key}"><span class="eyebrow">${m.label}</span><div class="value muted">--</div><p class="hint">No data yet</p></button>`;
+  // Steps and calories for today are running totals, so don't judge them against full days
+  const partial = (key === 'steps' || key === 'kcal') && st.date === isoDay(new Date());
+  const diff = st.avg7 != null ? st.latest - st.avg7 : null;
+  const good = diff == null || Math.abs(diff) < 1e-9 ? null : (diff > 0) === (m.better === 'up');
+  const prevN = Math.min(7, st.n - 1);
+  const cmp = partial ? `So far today · avg ${metricFmt(key, st.avg7)}`
+    : diff == null ? dayLabel(st.date) : `${signed(diff, (x) => metricFmt(key, x))} vs ${prevN === 1 ? 'yesterday' : `${prevN}-day avg`}`;
+  const tgt = targetFor(key);
+  return `<button class="card stat tap" type="button" data-metric="${key}"><span class="eyebrow">${m.label}</span>
+    <div><span class="value">${metricFmt(key, st.latest)}</span><span class="unit">${m.unit}</span></div>
+    <div class="delta ${good == null || partial ? 'muted' : good ? 'up' : 'down'}">${cmp}</div>
+    ${tgt ? `<div class="meter" aria-label="${Math.round((st.latest / tgt) * 100)}% of target"><span style="width:${Math.min(100, (st.latest / tgt) * 100)}%"></span></div>` : ''}
+    <canvas data-spark="${key}" aria-hidden="true"></canvas></button>`;
 }
 
-function readiness(days) {
-  const dates = Object.keys(days).sort();
-  const latest = [...dates].reverse().find((d) => days[d].hrv != null && days[d].rhr != null);
-  if (!latest) return null;
-  const prior = dates.filter((d) => d < latest);
-  const zh = zScore(days[latest].hrv, prior.map((d) => days[d].hrv).filter((v) => v != null));
-  const zr = zScore(days[latest].rhr, prior.map((d) => days[d].rhr).filter((v) => v != null));
-  if (zh == null || zr == null) return { date: latest, score: null };
-  const sleep = days[latest].sleepMin;
-  const sleepAdj = sleep ? Math.max(-10, Math.min(5, ((sleep - 450) / 60) * 5)) : 0;
-  const score = Math.round(Math.max(0, Math.min(100, 65 + 12 * zh - 12 * zr + sleepAdj)));
-  return { date: latest, score, zh, zr };
-}
-
-function statCard(label, key, days, unit, fmt = (v) => nf(v, 1), better = 'up') {
-  const s = series(days, key);
-  if (!s.length) return `<div class="card stat"><span class="eyebrow">${label}</span><div class="value muted">--</div><p class="hint">No data</p></div>`;
-  const [d, v] = s.at(-1);
-  // Today's steps are a running total, so compare against the 7 full days before it
-  const partial = key === 'steps' && d === isoDay(new Date());
-  const prev = s.slice(-8, -1).map((x) => x[1]);
-  const avg = prev.length ? prev.reduce((a, b) => a + b, 0) / prev.length : null;
-  const diff = avg != null ? v - avg : null;
-  const good = diff == null || Math.abs(diff) < 1e-9 ? null : (diff > 0) === (better === 'up');
-  const sign = diff > 0 ? '+' : diff < 0 ? '−' : '±';
-  return `<div class="card stat"><span class="eyebrow">${label}</span>
-    <div><span class="value">${fmt(v)}</span><span class="unit">${unit}</span></div>
-    <div class="delta ${good == null || partial ? 'muted' : good ? 'up' : 'down'}">${partial ? `So far today · ${prev.length}-day avg ${nf(avg)}` : diff == null ? fmtDate(d) : `${sign}${key === 'sleepMin' ? fmtSleep(Math.abs(diff)) : nf(Math.abs(diff), key === 'steps' ? 0 : 1)} vs ${prev.length === 1 ? 'yesterday' : `${prev.length}-day avg`}`}</div>
-    ${key === 'sleepMin' && days[d].deepMin != null ? `<div class="delta muted">Deep ${fmtSleep(days[d].deepMin)} · REM ${fmtSleep(days[d].remMin)}</div>` : ''}
-    <canvas data-key="${key}" role="img" aria-label="${label}, last 30 days"></canvas></div>`;
+function goalCard(id, label, value, unit, sub, tone) {
+  return `<button class="card stat tap" type="button" data-insight="${id}"><span class="eyebrow">${label}</span>
+    <div><span class="value">${value}</span><span class="unit">${unit}</span></div>
+    <div class="delta ${tone || 'muted'}">${sub}</div></button>`;
 }
 
 async function renderHealth(force = false) {
   const v = $('#view');
-  if (!settings.google.clientId) {
-    v.innerHTML = `<section class="card empty"><h2>Connect Google Health</h2>
-      <p class="muted">Daily data (resting HR, HRV, sleep, SpO2, steps) comes from the Google Health API. It needs a free Google Cloud OAuth client ID, set up once.</p>
-      <ol><li>Google Cloud console: create a project and enable the Google Health API.</li>
-      <li>OAuth consent screen: External, Testing, add your Google account as a test user.</li>
-      <li>Credentials: OAuth client ID, Web application. Add this site's address under Authorized JavaScript origins.</li>
-      <li>Paste the client ID in Settings.</li></ol>
-      <button class="btn primary" type="button" id="go-settings">Open Settings</button></section>`;
-    $('#go-settings').onclick = openSettings;
-    return;
-  }
   const cache = healthCache.get();
   if (!signedIn() && !cache) {
     v.innerHTML = `<section class="card empty"><h2>Sign in to Google Health</h2>
@@ -473,17 +539,22 @@ async function renderHealth(force = false) {
     $('#g-in').onclick = () => doSignIn();
     return;
   }
-  const stale = !cache || Date.now() - cache.fetchedAt > 5 * 60e3;
+  const stale = !cache || Date.now() - cache.fetchedAt > 5 * 60e3 || !cache.v2;
   if (signedIn() && (force || stale) && !healthLoading) {
     healthLoading = true;
     if (!cache) v.innerHTML = `<div class="grid">${'<div class="card"><div class="skeleton" style="height:96px"></div></div>'.repeat(6)}</div>`;
+    else drawHealth(cache);
     try {
-      // Keep zones accurate: resting HR follows the latest value from Google Health
-      const { days } = await fetchHealth(30);
-      const rhr = series(days, 'rhr').at(-1)?.[1];
-      if (rhr) { settings.profile.restHr = Math.round(rhr); saveSettings(); }
-    }
-    catch (e) {
+      const data = await fetchHealth(90);
+      data.v2 = true;
+      healthCache.set(data);
+      // Keep the profile in sync: resting HR for zones, and weight/body fat if a scale logs them
+      const p = P(), rhr = series(data.days, 'rhr').at(-1)?.[1];
+      if (rhr) p.restHr = Math.round(rhr);
+      if (data.weightKg) p.weight = Math.round(data.weightKg * 10) / 10;
+      if (data.bodyFatPct) p.bodyFat = Math.round(data.bodyFatPct * 10) / 10;
+      saveSettings();
+    } catch (e) {
       healthLoading = false;
       if (e instanceof AuthError) { toast(e.message); if (!cache) return renderHealth(); }
       else if (!cache) {
@@ -499,57 +570,193 @@ async function renderHealth(force = false) {
   drawHealth(healthCache.get());
 }
 
-function drawHealth(data) {
-  const days = data?.days || {};
-  const r = readiness(days);
-  const label = r?.score == null ? '' : r.score >= 75 ? 'Ready to push' : r.score >= 50 ? 'Train normally' : 'Take it easy';
+async function drawHealth(data) {
+  const days = data?.days || {}, p = P();
+  const ws = await allWorkouts().catch(() => []);
+  if (view !== 'health') return;
+  const r = readiness(days, p);
+  const lastNight = sortedDays(days).reverse().find((d) => days[d].sleepMin);
+  const sl = lastNight ? sleepScore(days[lastNight], p) : null;
+  const load = trainingLoad(ws, p), cm = cardioMinutes(ws), plan = shredPlan(p, days), fit = vo2(days, p);
   const today = data?.today || [], latest = data?.latest;
-  const tMin = today.length ? Math.min(...today.map((p) => p[2] ?? p[1])) : null;
-  const tMax = today.length ? Math.max(...today.map((p) => p[3] ?? p[1])) : null;
+  const tMin = today.length ? Math.min(...today.map((x) => x[2] ?? x[1])) : null;
+  const tMax = today.length ? Math.max(...today.map((x) => x[3] ?? x[1])) : null;
   let hideHint = false;
   try { hideHint = localStorage.getItem('pulse-hide-install') === '1'; } catch {}
+  const tone = (v, good, ok) => (v == null ? 'muted' : v >= good ? 'up' : v >= ok ? 'muted' : 'down');
   $('#view').innerHTML = `
     ${isIos && !standalone && !hideHint ? `<section class="card empty"><h2>Add Pulse to your Home Screen</h2>
       <p class="muted">In Safari, tap the Share button, then Add to Home Screen. Pulse then opens full screen like an app.</p>
       <button class="btn small" type="button" id="hide-install">Got it</button></section>` : ''}
     <section class="card">
-      <div class="card-head"><div><span class="eyebrow">Heart rate</span>
+      <div class="card-head"><button class="link-head" type="button" id="hr-open"><span class="eyebrow">Heart rate</span>
         <div class="stat"><span class="value" style="font-size:36px">${latest?.bpm ?? '--'}</span><span class="unit">bpm</span></div>
-        <div class="small muted">${latest ? `Latest reading, ${fmtAgo(latest.t)}` : 'No recent reading'}</div></div>
+        <div class="small muted">${latest ? `Latest reading, ${fmtAgo(latest.t)}` : 'No recent reading'}</div></button>
         <div class="btn-row">
           ${signedIn() ? '' : '<button class="btn small primary" type="button" id="g-in">Sign in</button>'}
           <button class="icon-btn ${healthLoading ? 'spinning' : ''}" type="button" id="h-refresh" aria-label="Refresh">${icon('refresh')}</button></div></div>
-      <canvas id="today-chart" class="chart" role="img" aria-label="Heart rate today, 5-minute averages"></canvas>
+      <canvas id="today-chart" class="chart" role="img" aria-label="Heart rate today, 5-minute averages. Drag to inspect."></canvas>
       <div class="mini-stats" style="grid-template-columns:repeat(3,1fr);margin-top:8px">
         <div><strong>${tMin ?? '--'}</strong><span>Low today</span></div>
         <div><strong>${tMax ?? '--'}</strong><span>High today</span></div>
-        <div><strong>${series(days, 'rhr').at(-1)?.[1] ?? '--'}</strong><span>Resting</span></div>
+        <div><strong>${p.restHr}</strong><span>Resting</span></div>
       </div>
     </section>
-    <section class="card">
-      <div class="card-head"><div><span class="eyebrow">Readiness${r ? `, ${fmtDate(r.date + 'T12:00')}` : ''}</span>
-        <div class="stat"><span class="value" style="font-size:36px">${r?.score ?? '--'}</span><span class="unit">/ 100</span></div>
-        <div class="${r?.score == null ? 'muted' : r.score >= 50 ? 'up' : 'down'} small">${label || 'Needs about 5 days of HRV and resting HR'}</div></div></div>
-      <p class="hint">Your HRV and resting HR today against your own 30-day baseline, nudged by last night's sleep. Higher HRV and lower resting HR score better.</p>
-    </section>
+    <button class="card tap readiness" type="button" data-insight="readiness">
+      <span class="eyebrow">Readiness${r ? `, ${dayLabel(r.date)}` : ''}</span>
+      <div class="stat"><span class="value" style="font-size:36px">${r?.score ?? '--'}</span><span class="unit">/ 100</span></div>
+      <div class="small ${r?.score == null ? 'muted' : r.score >= 55 ? 'up' : 'down'}">${r?.advice || `Needs ${Math.max(1, r?.need ?? 5)} more day${(r?.need ?? 5) === 1 ? '' : 's'} of HRV and resting HR`}</div>
+    </button>
+    <h2 class="section-title">Your goals</h2>
     <div class="grid">
-      ${statCard('Resting HR', 'rhr', days, 'bpm', (v) => nf(v), 'down')}
-      ${statCard('HRV', 'hrv', days, 'ms')}
-      ${statCard('Sleep', 'sleepMin', days, '', fmtSleep)}
-      ${statCard('Steps', 'steps', days, '', (v) => nf(v))}
-      ${statCard('SpO2', 'spo2', days, '%')}
-      ${statCard('Breathing', 'resp', days, '/min', (v) => nf(v, 1), 'down')}
+      ${goalCard('sleep', 'Sleep score', sl?.score ?? '--', '/ 100', lastNight ? `Last night · target ${p.sleepTarget}h` : 'No sleep data', tone(sl?.score, 80, 65))}
+      ${goalCard('shred', 'Shred plan', plan.eat ? nf(plan.eat) : '--', plan.eat ? 'kcal/day' : '', plan.eat ? `Eat target · ${plan.toLose} kg fat to go` : `${plan.toLose} kg fat to go · needs burn data`)}
+      ${goalCard('load', 'Training load', load.ratio != null ? load.ratio.toFixed(2) : '--', '', load.ratio != null ? load.status.split(':')[0] : `${load.acute} this week`, load.ratio == null ? '' : load.ratio > 1.5 || load.ratio < 0.8 ? 'down' : 'up')}
+      ${goalCard('cardio', 'Cardio minutes', cm, `/ ${p.cardioTarget}`, 'This week, moderate or harder', tone(cm / p.cardioTarget, 1, 0.6))}
+      ${goalCard('vo2', 'Cardio fitness', fit ? nf(fit.value, 1) : '--', 'VO2 max', fit ? `${vo2Band(fit.value)}${fit.source === 'Fitbit' ? '' : ' · estimate'}` : 'Not enough data')}
     </div>
+    <h2 class="section-title">Body</h2>
+    <div class="grid">${['rhr', 'hrv', 'sleepMin', 'steps', 'kcal', 'spo2', 'resp'].map((k) => statCard(k, days)).join('')}</div>
     ${data?.errors?.length ? `<section class="card"><h3>Some data didn't load</h3><ul class="small muted">${data.errors.map((e) => `<li>${esc(e)}</li>`).join('')}</ul></section>` : ''}
-    <p class="hint">Updated ${data ? fmtTime(data.fetchedAt) : 'never'}${signedIn() ? '' : ' · signed out, showing saved data'}. The Air syncs through the Google Health app on your phone; open it to sync now.</p>`;
-  drawLine($('#today-chart'), today.map(([t, v]) => [t, v]), { labels: true });
-  $('#hide-install')?.addEventListener('click', () => { try { localStorage.setItem('pulse-hide-install', '1'); } catch {} drawHealth(data); });
-  $('#view').querySelectorAll('canvas[data-key]').forEach((c) => {
-    const s = series(days, c.dataset.key).map(([d, v]) => [new Date(d).getTime(), v]);
-    drawLine(c, s);
+    <p class="hint">Updated ${data ? fmtTime(data.fetchedAt) : 'never'}${signedIn() ? ' · heart rate refreshes every minute while open' : ' · signed out, showing saved data'}. The Air syncs through the Google Health app on your phone; open it to sync now.</p>`;
+
+  const tc = $('#today-chart');
+  drawLine(tc, today, { labels: true, band: true });
+  scrub(tc, (x) => `<strong>${x[1]} bpm</strong> ${fmtTime(x[0])}${x[2] != null ? `<span>${x[2]}-${x[3]} in 5 min</span>` : ''}`);
+  $('#view').querySelectorAll('canvas[data-spark]').forEach((c) => {
+    drawLine(c, series(days, c.dataset.spark, 30).map(([d, v]) => [Date.parse(`${d}T12:00`), v]));
   });
+  $('#view').querySelectorAll('[data-metric]').forEach((b) => (b.onclick = () => openMetric(b.dataset.metric)));
+  $('#view').querySelectorAll('[data-insight]').forEach((b) => (b.onclick = () => openInsight(b.dataset.insight)));
+  $('#hr-open').onclick = () => openHeartRate();
+  $('#hide-install')?.addEventListener('click', () => { try { localStorage.setItem('pulse-hide-install', '1'); } catch {} drawHealth(data); });
   $('#h-refresh').onclick = () => (signedIn() ? renderHealth(true) : doSignIn());
   $('#g-in')?.addEventListener('click', doSignIn);
+}
+
+// ---------- Detail sheets
+const statGrid = (items) => `<div class="stat-grid">${items.filter(Boolean).map(([k, v, cls]) => `<div><span>${k}</span><strong class="${cls || ''}">${v}</strong></div>`).join('')}</div>`;
+const rangeTabs = (n) => `<div class="seg" role="tablist">${[7, 30, 90].map((d) => `<button type="button" role="tab" data-range="${d}" aria-selected="${d === n}">${d} days</button>`).join('')}</div>`;
+
+function openMetric(key, n = 30) {
+  const days = healthCache.get()?.days || {}, m = METRICS[key], p = P();
+  const s = series(days, key, n), st = stats(s), fmt = (v) => metricFmt(key, v);
+  const tgt = targetFor(key);
+  const goodTrend = st?.trend == null ? null : (st.trend > 0) === (m.better === 'up');
+  let extra = '';
+  if (key === 'sleepMin' && st) {
+    const d = days[st.date], sc = sleepScore(d, p), bt = bedtimeSpread(days);
+    const avgOf = (k) => { const v = s.map(([dd]) => days[dd][k]).filter((x) => x != null); return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null; };
+    extra = `<div><h3>Last night</h3>${d.deepMin != null ? barsHtml({ Deep: d.deepMin, REM: d.remMin, Light: d.lightMin, Awake: d.awakeMin || 0 }, fmtSleep) : '<p class="hint">No stage data.</p>'}
+      ${d.bedtime ? `<p class="small muted" style="margin-top:8px">${fmtTime(d.bedtime)} to ${fmtTime(d.wake)}${sc ? ` · sleep score ${sc.score}` : ''}</p>` : ''}</div>
+      ${statGrid([['Avg deep', fmtSleep(avgOf('deepMin'))], ['Avg REM', fmtSleep(avgOf('remMin'))], bt && ['Avg bedtime', bt.avg], bt && ['Bedtime spread', `±${bt.sd} min`, bt.sd <= 30 ? 'up' : bt.sd > 60 ? 'down' : '']])}
+      <p class="hint">A steady bedtime (within ±30 min) improves deep sleep and next-day HRV.</p>`;
+  }
+  if (tgt && st) {
+    const hit = s.filter(([, v]) => v >= tgt).length;
+    extra += `<p class="small"><strong>${hit} of ${s.length}</strong> days hit your target of ${fmt(tgt)}.</p>`;
+  }
+  if ((key === 'rhr' || key === 'hrv' || key === 'resp') && st?.sd) {
+    const z = (st.latest - st.avg) / st.sd;
+    extra += `<p class="small">Latest is <strong>${Math.abs(z).toFixed(1)} SD ${z >= 0 ? 'above' : 'below'}</strong> your ${n}-day baseline (${fmt(st.avg - st.sd)} to ${fmt(st.avg + st.sd)} is your normal range).</p>`;
+  }
+  if (key === 'kcal') extra += '<button class="btn small" type="button" data-go="shred">Open shred plan</button>';
+  openSheet(m.label, `${rangeTabs(n)}
+    ${st ? `<div class="chart-box"><canvas class="chart tall" id="m-chart" role="img" aria-label="${m.label}, last ${n} days. Drag to inspect."></canvas></div>
+    ${statGrid([
+      ['Latest', `${fmt(st.latest)} ${m.unit}`], ['7-day avg', fmt(st.avg7)], [`${n}-day avg`, fmt(st.avg)],
+      ['Low', `${fmt(st.min[1])} · ${fmtDate(`${st.min[0]}T12:00`).replace(/^\w+ /, '')}`], ['High', `${fmt(st.max[1])} · ${fmtDate(`${st.max[0]}T12:00`).replace(/^\w+ /, '')}`],
+      st.trend != null && ['Trend', `${signed(st.trend, (x) => metricFmt(key, x))}/week`, goodTrend == null ? '' : goodTrend ? 'up' : 'down'],
+    ])}
+    ${extra}` : '<p class="hint">No data in this range yet.</p>'}
+    <p class="hint">${m.note}</p>`, (el) => {
+    el.querySelectorAll('[data-range]').forEach((b) => (b.onclick = () => openMetric(key, +b.dataset.range)));
+    el.querySelector('[data-go]')?.addEventListener('click', () => openInsight('shred'));
+    const c = el.querySelector('#m-chart');
+    if (!c) return;
+    const pts = s.map(([d, v]) => [Date.parse(`${d}T12:00`), v]);
+    requestAnimationFrame(() => {
+      drawLine(c, pts, { labels: true, dots: true, target: tgt, fmtY: key === 'sleepMin' ? (v) => `${Math.round(v / 60)}h` : null });
+      scrub(c, (x) => `<strong>${fmt(x[1])} ${m.unit}</strong> ${fmtDate(x[0])}`);
+    });
+  });
+}
+
+function openHeartRate() {
+  const data = healthCache.get(), p = P(), today = data?.today || [];
+  const secs = ZONES.map(() => 0);
+  for (const x of today) secs[zoneIndex(x[1], p)] += 300;
+  openSheet('Heart rate today', `
+    <div class="chart-box"><canvas class="chart tall" id="hr-chart" role="img" aria-label="Heart rate today. Drag to inspect."></canvas></div>
+    ${statGrid([['Latest', data?.latest ? `${data.latest.bpm} bpm` : '--'], ['Low', today.length ? `${Math.min(...today.map((x) => x[2] ?? x[1]))} bpm` : '--'],
+      ['High', today.length ? `${Math.max(...today.map((x) => x[3] ?? x[1]))} bpm` : '--'], ['Resting', `${p.restHr} bpm`], ['Max (est.)', `${maxHr(p)} bpm`]])}
+    <div><h3 style="margin-bottom:8px">Time in your zones today</h3>${zonesHtml(secs)}</div>
+    <p class="hint">5-minute averages; the shaded band is the low-high range in each window. Data arrives a few minutes after the Air syncs.</p>`, (el) => {
+    const c = el.querySelector('#hr-chart');
+    requestAnimationFrame(() => {
+      drawLine(c, today, { labels: true, band: true });
+      scrub(c, (x) => `<strong>${x[1]} bpm</strong> ${fmtTime(x[0])}${x[2] != null ? `<span>${x[2]}-${x[3]}</span>` : ''}`);
+    });
+  });
+}
+
+async function openInsight(id) {
+  const days = healthCache.get()?.days || {}, p = P();
+  const ws = await allWorkouts().catch(() => []);
+  if (id === 'readiness') {
+    const r = readiness(days, p);
+    const z = (v) => (v == null ? '--' : `${signed(v, (x) => x.toFixed(1))} SD`);
+    openSheet('Readiness', `
+      <div class="stat"><span class="value" style="font-size:44px">${r?.score ?? '--'}</span><span class="unit">/ 100</span></div>
+      <p><strong>${r?.advice || 'Not enough data yet'}</strong></p>
+      ${statGrid([['HRV vs baseline', z(r?.zh), r?.zh == null ? '' : r.zh >= 0 ? 'up' : 'down'], ['Resting HR vs baseline', z(r?.zr), r?.zr == null ? '' : r.zr <= 0 ? 'up' : 'down'], ['Sleep score', r?.sleep ?? '--']])}
+      <p class="hint">Built for your goals: on high days push strength PRs or intervals; on low days keep the cut going with steps and easy Zone 2 instead of hard sessions, so you hold muscle while losing fat. Uses your last 30 days as the baseline.</p>`);
+  } else if (id === 'sleep') {
+    const d = sortedDays(days).reverse().find((x) => days[x].sleepMin), sc = d ? sleepScore(days[d], p) : null;
+    openSheet('Sleep score', `
+      <div class="stat"><span class="value" style="font-size:44px">${sc?.score ?? '--'}</span><span class="unit">/ 100</span></div>
+      ${sc ? `<div class="zones">${sc.parts.map((x, i) => `<div class="zone-row"><span>${x.name}</span><div class="zone-track"><div class="zone-fill" style="width:${x.score}%;background:var(--z${i + 2})"></div></div><span class="num">${Math.round(x.score)}</span></div>`).join('')}</div>
+      <p class="small muted">${sc.parts.filter((x) => x.detail).map((x) => `${x.name}: ${x.detail}`).join(' · ')}</p>` : ''}
+      ${statGrid([['Asleep', d ? fmtSleep(days[d].sleepMin) : '--'], ['Target', `${p.sleepTarget}h`]])}
+      <p class="hint">Duration counts most (45%), then deep and REM share and efficiency. For a cut with strength goals aim for ${p.sleepTarget}h: short sleep raises hunger hormones and makes you lose more muscle per kg lost.</p>
+      <button class="btn small" type="button" data-go="sleepMin">Sleep history</button>`, (el) => el.querySelector('[data-go]').onclick = () => openMetric('sleepMin'));
+  } else if (id === 'shred') {
+    const s = shredPlan(p, days);
+    const eta = new Date(Date.now() + s.weeks * 7 * 864e5);
+    openSheet('Shred plan', `
+      <p>From <strong>${p.bodyFat}%</strong> to <strong>${p.targetBodyFat}%</strong> body fat at ${p.weight} kg.</p>
+      ${statGrid([['Lean mass', `${s.lean} kg`], ['Goal weight', `${s.goalWeight} kg`], ['Fat to lose', `${s.toLose} kg`],
+        ['Pace', `${s.weekly} kg/week`], ['Time', `~${s.weeks} weeks`], ['Target date', eta.toLocaleDateString(undefined, { day: 'numeric', month: 'short' })],
+        ['Avg burn (7 d)', s.burn ? `${nf(s.burn)} kcal` : '--'], ['Daily deficit', `${s.deficit} kcal`], ['Eat', s.eat ? `${nf(s.eat)} kcal` : '--', 'up'],
+        ['Protein', `${s.protein} g/day`, 'up']])}
+      <p class="hint">0.5% of body weight per week is the pace that keeps strength while cutting. Keep lifting heavy (it tells your body to keep muscle), hit protein every day, and use steps for extra burn rather than more hard cardio. Body fat % is from your Settings; update it every few weeks (calipers, scale or DEXA) and the plan recalculates.</p>
+      <button class="btn small" type="button" data-go="settings">Edit body stats</button>`, (el) => el.querySelector('[data-go]').onclick = () => { sheet.close(); openSettings(); });
+  } else if (id === 'load') {
+    const l = trainingLoad(ws, p);
+    const weeks = [3, 2, 1, 0].map((k) => {
+      const from = Date.now() - (k + 1) * 7 * 864e5, to = Date.now() - k * 7 * 864e5;
+      return [k === 0 ? 'This week' : `${k} wk ago`, Math.round(ws.filter((w) => w.start >= from && w.start < to).reduce((a, w) => a + trimp(w, p), 0))];
+    });
+    const top = Math.max(1, ...weeks.map((x) => x[1]));
+    openSheet('Training load', `
+      <div class="stat"><span class="value" style="font-size:44px">${l.ratio != null ? l.ratio.toFixed(2) : '--'}</span><span class="unit">acute : chronic</span></div>
+      <p><strong>${l.status}</strong></p>
+      <div class="zones">${weeks.map(([k, v], i) => `<div class="zone-row"><span>${k}</span><div class="zone-track"><div class="zone-fill" style="width:${(v / top) * 100}%;background:var(--z${i + 2})"></div></div><span class="num">${v}</span></div>`).join('')}</div>
+      ${statGrid([['Last 7 days', l.acute], ['Weekly avg (28 d)', l.chronic]])}
+      <p class="hint">Load = minutes × heart-rate intensity (TRIMP), from every workout the Air or Pulse recorded. Keep the ratio between 0.8 and 1.3: you build strength and cardio without the fatigue that stalls a cut. Lifting sessions show lower load than cardio because heart rate is lower; that's expected.</p>`);
+  } else if (id === 'cardio') {
+    const weeks = [3, 2, 1, 0].map((k) => [k === 0 ? 'This week' : `${k} wk ago`, cardioMinutes(ws.filter((w) => w.start < Date.now() - k * 7 * 864e5).map((w) => ({ ...w, start: w.start + k * 7 * 864e5 })))]);
+    openSheet('Cardio minutes', `
+      <div class="zones">${weeks.map(([k, v], i) => `<div class="zone-row"><span>${k}</span><div class="zone-track"><div class="zone-fill" style="width:${Math.min(100, (v / p.cardioTarget) * 100)}%;background:var(--z${i + 2})"></div></div><span class="num">${v}</span></div>`).join('')}</div>
+      <p class="hint">Minutes at moderate intensity or harder in workouts. Target ${p.cardioTarget}/week to raise VO2 max: mostly Zone 2 (${zoneBpm(2, p)}-${zoneBpm(3, p)} bpm, can hold a conversation) plus one interval session. Zone 2 burns fat without hurting leg day.</p>`);
+  } else if (id === 'vo2') {
+    const f = vo2(days, p);
+    openSheet('Cardio fitness', `
+      <div class="stat"><span class="value" style="font-size:44px">${f ? nf(f.value, 1) : '--'}</span><span class="unit">ml/kg/min</span></div>
+      <p><strong>${f ? vo2Band(f.value) : 'Not enough data'}</strong> for men 20-29${f ? ` · ${f.source}` : ''}</p>
+      ${statGrid([['Excellent', '55+'], ['Good', '49-54'], ['Average', '43-48']])}
+      <p class="hint">VO2 max is the strongest single marker of cardio fitness. It rises with Zone 2 volume and weekly intervals, and also rises as you lose fat (it's per kg). ${f?.source === 'Fitbit' ? '' : 'This is an estimate from your max and resting heart rate; Fitbit gives a measured value after outdoor runs with GPS.'}</p>`);
+  }
 }
 
 function doSignIn() {
@@ -574,7 +781,13 @@ async function coachContext() {
   const ws = (await workouts.all()).filter((w) => !w.active).slice(0, 15);
   const h = healthCache.get();
   return {
-    profile: { age: p.age, sex: p.sex, weightKg: p.weight, restingHr: p.restHr, maxHr: maxHr(p) },
+    profile: { age: p.age, sex: p.sex, weightKg: p.weight, heightCm: p.height, bodyFatPct: p.bodyFat, restingHr: p.restHr, maxHr: maxHr(p) },
+    goals: { targetBodyFatPct: p.targetBodyFat, alsoWants: ['increase strength', 'increase cardio fitness', 'improve sleep'], sleepTargetH: p.sleepTarget, dailySteps: p.stepTarget, cardioMinPerWeek: p.cardioTarget },
+    derived: h ? (() => {
+      const all = [...ws.map((w) => ({ ...w, duration: w.summary?.duration, avgHr: w.summary?.avg })), ...(h.exercises || [])];
+      const night = sortedDays(h.days).reverse().find((d) => h.days[d].sleepMin);
+      return { shredPlan: shredPlan(p, h.days), trainingLoad: trainingLoad(all, p), cardioMinutesThisWeek: cardioMinutes(all), vo2max: vo2(h.days, p), lastNightSleepScore: night ? sleepScore(h.days[night], p) : null };
+    })() : null,
     zones: ZONES.map((z, i) => ({ name: z.name, fromBpm: zoneBpm(i, p) })),
     recentWorkouts: ws.map((w) => ({
       date: new Date(w.start).toISOString().slice(0, 16), type: w.title, minutes: Math.round(w.summary.duration / 60),
@@ -588,7 +801,7 @@ async function coachContext() {
     })),
     heartRateToday: h?.today?.length ? { latest: h.latest, fiveMinuteAverages: h.today.map(([t, v]) => [new Date(t).toTimeString().slice(0, 5), v]) } : null,
     dailyHealth: h?.days || 'Google Health not connected',
-    readiness: h ? readiness(h.days) : null,
+    readiness: h ? readiness(h.days, P()) : null,
     liveNow: live.hr && Date.now() - live.at < 5000 ? { bpm: live.hr, hrvRmssdMs: rmssd(live.rr) } : null,
   };
 }
@@ -649,8 +862,17 @@ function openSettings() {
         <div class="field"><label for="weight">Weight (kg)</label><input id="weight" type="number" inputmode="decimal" min="30" max="250" value="${p.weight}"></div>
         <div class="field"><label for="restHr">Resting HR</label><input id="restHr" type="number" inputmode="numeric" min="30" max="120" value="${p.restHr}"></div>
         <div class="field"><label for="maxHr">Max HR</label><input id="maxHr" type="number" inputmode="numeric" min="120" max="230" placeholder="Auto: ${Math.round(208 - 0.7 * p.age)}" value="${p.maxHr ?? ''}"></div>
+        <div class="field"><label for="height">Height (cm)</label><input id="height" type="number" inputmode="numeric" min="120" max="230" value="${p.height}"></div>
+        <div class="field"><label for="bodyFat">Body fat %</label><input id="bodyFat" type="number" inputmode="decimal" min="3" max="50" step="0.1" value="${p.bodyFat}"></div>
       </div>
-      <p class="hint">Used for zones and calorie estimates. Resting HR updates from Google Health when you're signed in. Leave Max HR empty to estimate it from age.</p>
+      <h3>Goals</h3>
+      <div class="form-grid">
+        <div class="field"><label for="targetBodyFat">Target body fat %</label><input id="targetBodyFat" type="number" inputmode="decimal" min="3" max="40" step="0.5" value="${p.targetBodyFat}"></div>
+        <div class="field"><label for="sleepTarget">Sleep target (h)</label><input id="sleepTarget" type="number" inputmode="decimal" min="5" max="11" step="0.25" value="${p.sleepTarget}"></div>
+        <div class="field"><label for="stepTarget">Daily steps</label><input id="stepTarget" type="number" inputmode="numeric" min="1000" step="500" value="${p.stepTarget}"></div>
+        <div class="field"><label for="cardioTarget">Cardio min/week</label><input id="cardioTarget" type="number" inputmode="numeric" min="30" step="10" value="${p.cardioTarget}"></div>
+      </div>
+      <p class="hint">Used for zones, calories and the shred plan. Resting HR (and weight or body fat, if a scale logs them) update from Google Health. Leave Max HR empty to estimate it from age.</p>
       <h3>Alerts</h3>
       <div class="form-grid">
         <div class="field"><label for="high">Alert above (bpm)</label><input id="high" type="number" inputmode="numeric" placeholder="Off" value="${a.high || ''}"></div>
@@ -671,7 +893,11 @@ function openSettings() {
     </form>`, (el) => {
     const num = (id) => { const v = el.querySelector(id).value; return v === '' ? null : Number(v); };
     el.querySelector('#set').addEventListener('change', () => {
-      Object.assign(settings.profile, { age: num('#age') || 30, sex: el.querySelector('#sex').value, weight: num('#weight') || 75, restHr: num('#restHr') || 60, maxHr: num('#maxHr') });
+      Object.assign(settings.profile, {
+        age: num('#age') || 25, sex: el.querySelector('#sex').value, weight: num('#weight') || 84, restHr: num('#restHr') || 60, maxHr: num('#maxHr'),
+        height: num('#height') || 177, bodyFat: num('#bodyFat') || 15, targetBodyFat: num('#targetBodyFat') || 13,
+        sleepTarget: num('#sleepTarget') || 8, stepTarget: num('#stepTarget') || 10000, cardioTarget: num('#cardioTarget') || 150,
+      });
       Object.assign(settings.alerts, { high: num('#high') || 0, low: num('#low') || 0, sound: el.querySelector('#sound').checked });
       settings.google.clientId = el.querySelector('#gid').value.trim();
       settings.claude.key = el.querySelector('#ckey').value.trim();
@@ -721,6 +947,11 @@ function render() {
 }
 
 window.addEventListener('hashchange', render);
+// Near-live: pull today's heart rate every minute while Today is on screen
+setInterval(async () => {
+  if (view !== 'health' || document.visibilityState !== 'visible' || !signedIn() || scrubbing || sheet.open || healthLoading) return;
+  try { const d = await refreshToday(); if (d && view === 'health' && !scrubbing && !sheet.open) drawHealth(d); } catch {}
+}, 60000);
 window.addEventListener('resize', () => { if (view === 'live') updateLive(); });
 setInterval(() => { if (view === 'live') updateLive(); }, 1000);
 document.addEventListener('visibilitychange', async () => {

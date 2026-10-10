@@ -107,6 +107,17 @@ function dateOf(v) {
 
 const asNum = (v) => (typeof v === 'number' ? v : typeof v === 'string' && /^-?\d+(\.\d+)?$/.test(v) ? +v : null);
 
+// First number in an object (for value fields not yet confirmed against real responses).
+function firstNum(o) {
+  for (const [k, v] of Object.entries(o || {})) {
+    if (k === 'date' || /time|offset/i.test(k)) continue;
+    const n = asNum(v);
+    if (n != null) return n;
+    if (v && typeof v === 'object' && !Array.isArray(v)) { const r = firstNum(v); if (r != null) return r; }
+  }
+  return null;
+}
+
 const secs = (d) => (d ? parseFloat(d) : null); // "1792.800s" -> 1792.8
 
 // Heart rate in fixed windows: [[startMs, avg, min, max], ...] oldest first.
@@ -134,8 +145,30 @@ function toWorkout(p) {
   };
 }
 
+// Today's heart rate (5-minute windows) and the latest single reading.
+async function todayHr() {
+  const now = new Date(), midnight = new Date(now); midnight.setHours(0, 0, 0, 0);
+  const since = new Date(now.getTime() - 6 * 3600e3).toISOString();
+  const [today, j] = await Promise.all([
+    fetchHrRange(midnight, now),
+    api(`heart-rate/dataPoints?${new URLSearchParams({ pageSize: '1', filter: `heart_rate.sample_time.physical_time >= "${since}"` })}`),
+  ]);
+  const h = j.dataPoints?.[0]?.heartRate;
+  return { today, latest: h ? { bpm: asNum(h.beatsPerMinute), t: Date.parse(h.sampleTime.physicalTime) } : undefined };
+}
+
+// Light refresh for the open app (every minute): only today's heart rate.
+export async function refreshToday() {
+  const r = await todayHr();
+  const cache = healthCache.get();
+  if (!cache) return null;
+  Object.assign(cache, r);
+  healthCache.set(cache);
+  return cache;
+}
+
 // Pulls the last `days` days into { days: { 'YYYY-MM-DD': { rhr, hrv, spo2, resp, sleepMin, steps } }, today, latest, exercises, errors }.
-export async function fetchHealth(days = 30) {
+export async function fetchHealth(days = 90) {
   const end = new Date();
   const start = new Date(end); start.setDate(start.getDate() - days);
   const from = isoDay(start);
@@ -163,7 +196,10 @@ export async function fetchHealth(days = 30) {
       d.sleepMin = (d.sleepMin || 0) + mins;
       if (s.metadata?.mainSleep) {
         const st = Object.fromEntries((s.summary?.stagesSummary || []).map((x) => [x.type, asNum(x.minutes)]));
-        Object.assign(d, { deepMin: st.DEEP, remMin: st.REM, lightMin: st.LIGHT, awakeMin: st.AWAKE });
+        Object.assign(d, {
+          deepMin: st.DEEP, remMin: st.REM, lightMin: st.LIGHT, awakeMin: st.AWAKE,
+          inBedMin: asNum(s.summary?.minutesInSleepPeriod), bedtime: startT.getTime(), wake: endT.getTime(),
+        });
       }
     }
   })());
@@ -172,7 +208,8 @@ export async function fetchHealth(days = 30) {
     const tomorrow = new Date(end); tomorrow.setDate(end.getDate() + 1);
     const j = await api('steps/dataPoints:dailyRollUp', {
       method: 'POST',
-      body: JSON.stringify({ range: { start: civil(start), end: civil(tomorrow) }, windowSizeDays: 1 }),
+      // range is capped at 90 days including today
+      body: JSON.stringify({ range: { start: civil(new Date(end.getTime() - 89 * 864e5)), end: civil(tomorrow) }, windowSizeDays: 1 }),
     });
     for (const p of j.rollupDataPoints || []) {
       const d = dateOf(p.civilStartTime);
@@ -181,20 +218,37 @@ export async function fetchHealth(days = 30) {
     }
   })());
 
-  const extra = {};
-  const midnight = new Date(end); midnight.setHours(0, 0, 0, 0);
-  tasks.push(fetchHrRange(midnight, end).then((r) => { extra.today = r; }));
+  // Total daily calorie burn (API allows 14 days per request)
   tasks.push((async () => {
-    const since = new Date(end.getTime() - 6 * 3600e3).toISOString();
-    const j = await api(`heart-rate/dataPoints?${new URLSearchParams({ pageSize: '1', filter: `heart_rate.sample_time.physical_time >= "${since}"` })}`);
-    const h = j.dataPoints?.[0]?.heartRate;
-    if (h) extra.latest = { bpm: asNum(h.beatsPerMinute), t: Date.parse(h.sampleTime.physicalTime) };
+    const s14 = new Date(end); s14.setDate(end.getDate() - 13);
+    const tomorrow = new Date(end); tomorrow.setDate(end.getDate() + 1);
+    const j = await api('total-calories/dataPoints:dailyRollUp', {
+      method: 'POST', body: JSON.stringify({ range: { start: civil(s14), end: civil(tomorrow) }, windowSizeDays: 1 }),
+    });
+    for (const p of j.rollupDataPoints || []) {
+      const d = dateOf(p.civilStartTime), n = firstNum(p.totalCalories ?? p);
+      if (d && n) day(d).kcal = Math.round(n);
+    }
   })());
+  tasks.push(list('daily-vo2-max', `daily_vo2_max.date >= "${from}"`).then((pts) => {
+    for (const p of pts) { const v = p.dailyVo2Max, d = dateOf(v), n = firstNum(v); if (d && n) day(d).vo2 = Math.round(n * 10) / 10; }
+  }).catch(() => {})); // optional
+
+  const extra = {};
+  // Latest logged weight and body fat, if any (e.g. from a smart scale)
+  tasks.push(api('weight/dataPoints?pageSize=1').then((j) => {
+    const w = j.dataPoints?.[0]?.weight; const n = firstNum(w);
+    if (n) extra.weightKg = n > 1000 ? n / 1000 : n; // grams or kg
+  }).catch(() => {}));
+  tasks.push(api('body-fat/dataPoints?pageSize=1').then((j) => {
+    const n = firstNum(j.dataPoints?.[0]?.bodyFat); if (n) extra.bodyFatPct = n;
+  }).catch(() => {}));
+  tasks.push(todayHr().then((r) => Object.assign(extra, r)));
   tasks.push(list('exercise', `exercise.interval.civil_start_time >= "${from}"`, 4).then((pts) => {
     extra.exercises = pts.filter((p) => p.exercise?.interval).map(toWorkout);
   }));
 
-  const names = ['resting HR', 'HRV', 'SpO2', 'respiratory rate', 'sleep', 'steps', "today's heart rate", 'latest heart rate', 'workouts'];
+  const names = ['resting HR', 'HRV', 'SpO2', 'respiratory rate', 'sleep', 'steps', 'calories', 'VO2 max', 'weight', 'body fat', "today's heart rate", 'workouts'];
   const results = await Promise.allSettled(tasks);
   results.forEach((r, i) => {
     if (r.status === 'rejected') {

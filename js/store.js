@@ -3,7 +3,12 @@ const KEY = 'pulse-settings';
 const HEALTH_KEY = 'pulse-health';
 
 const DEFAULTS = {
-  profile: { age: 30, sex: 'male', weight: 75, restHr: 60, maxHr: null },
+  // Calibrated to Daniel: 25, male, 84 kg, 177 cm, ~15% body fat. Goals: shred to 13%, strength, cardio, sleep.
+  profile: {
+    age: 25, sex: 'male', weight: 84, height: 177, bodyFat: 15, targetBodyFat: 13,
+    restHr: 51, maxHr: null, sleepTarget: 8, stepTarget: 10000, cardioTarget: 150,
+  },
+  calibrated: 0,
   alerts: { high: 175, low: 0, sound: true },
   // Public OAuth client ID from the "Pulse" Google Cloud project (not a secret).
   google: { clientId: '843389086456-vpmtg454o7gd1l0aqm4jvqjssg2kvgn8.apps.googleusercontent.com' },
@@ -25,6 +30,11 @@ function merge(d, s = {}) {
 }
 
 export const settings = merge(DEFAULTS, read(KEY) || {});
+// One-time move from the original placeholder profile to the calibrated one.
+if (settings.calibrated < 1) {
+  settings.profile = { ...settings.profile, ...DEFAULTS.profile, restHr: settings.profile.restHr || DEFAULTS.profile.restHr };
+  settings.calibrated = 1;
+}
 export const saveSettings = () => write(KEY, settings);
 
 export const healthCache = {
