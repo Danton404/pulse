@@ -293,7 +293,7 @@ function renderLive() {
         <p class="muted">${isIos ? 'Apple doesn\'t let Safari or home-screen apps use Bluetooth, so this device can\'t connect to the Air directly.' : 'This browser can\'t use Bluetooth.'} Your heart rate still updates every minute on Today.</p>
         <ol>${isIos ? '<li>For second-by-second heart rate on iPhone, open danton404.github.io/pulse in the free <a href="https://apps.apple.com/app/bluefy-web-ble-browser/id1492822055" target="_blank" rel="noopener">Bluefy</a> browser.</li>' : ''}
         <li>On a laptop: use Chrome, Edge or Brave.</li>
-        <li>In the Google Health app: Fitbit Air settings, Connections, turn on Share heart rate.</li></ol>
+        <li>In the Google Health app: Connections icon (top left), Fitbit Air, Share heart rate, Get started.</li></ol>
         <a class="btn primary" href="#health">Go to Today</a></section>`
     : '';
 
@@ -317,7 +317,7 @@ function renderLive() {
           : `<button id="conn-btn" class="btn ${ble.state === 'lost' ? '' : 'primary'}" type="button" ${ble.state === 'connecting' ? 'disabled' : ''}>${icon('bluetooth', 18)} ${ble.state === 'lost' ? 'Reconnect' : 'Connect Fitbit Air'}</button>`}
         ${ble.state === 'lost' ? `<button id="conn-new" class="btn primary" type="button">Pick device</button>` : ''}
       </div>
-      ${!connected && ble.state !== 'reconnecting' ? `<p class="hint">First turn on Share heart rate for the Air in the Google Health app (Connections), then connect here.</p>` : ''}
+      ${!connected && ble.state !== 'reconnecting' ? `<p class="hint">First, in the Google Health app on your phone: tap the Connections icon (top left), choose Fitbit Air, tap Share heart rate, then Get started. Keep the Air near the laptop and connect here.</p>` : ''}
     </section>
     <section class="card" ${ble.supported ? '' : 'hidden'}>
       ${s ? `<div class="session-bar">

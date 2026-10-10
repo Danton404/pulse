@@ -1,6 +1,6 @@
 // Network-first for the app shell so updates show up immediately; cache is the offline fallback.
 // API requests (other origins) are never cached.
-const VERSION = 'pulse-20261010-1829';
+const VERSION = 'pulse-20261010-1921';
 const SHELL = [
   './',
   'index.html',
